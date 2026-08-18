@@ -12,7 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # НАСТРОЙКИ
 # =========================
 
-BOT_TOKEN = os.getenv("8331988232:AAEP2M_TorpiZy5ucYdUFIuY1rISAAoDAkg")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError(
