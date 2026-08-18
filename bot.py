@@ -125,7 +125,7 @@ def ticket_exists(user_id: int) -> bool:
     return row is not None
 
 
-def create_ticket(user_id: int, full_name: str, username: str | None):
+def create_ticket_db(user_id: int, full_name: str, username: str | None):
     with closing(db_connect()) as db:
         db.execute(
             """
@@ -473,7 +473,7 @@ async def create_ticket(callback: CallbackQuery):
         )
         return
 
-    create_ticket(
+    create_ticket_db(
         user_id,
         callback.from_user.full_name,
         callback.from_user.username
@@ -1026,6 +1026,10 @@ async def health(request):
 async def main():
     init_db()
 
+    # Polling and webhook mode cannot be used at the same time.
+    # Remove any old webhook before starting polling.
+    await bot.delete_webhook(drop_pending_updates=False)
+
     app = web.Application()
 
     app.router.add_get("/", health)
@@ -1058,6 +1062,11 @@ async def main():
 
     try:
         await dp.start_polling(bot)
+    except Exception as e:
+        print("❌ Polling остановлен.")
+        print(f"Причина: {e}")
+        print("Проверь, что этот BOT_TOKEN не используется другим запущенным ботом/сервисом.")
+        raise
     finally:
         await bot.session.close()
 
