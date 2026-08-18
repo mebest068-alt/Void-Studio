@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("8331988232:AAEP2M_TorpiZy5ucYdUFIuY1rISAAoDAkg")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1706479196"))
 
-bot = Bot(8331988232:AAEP2M_TorpiZy5ucYdUFIuY1rISAAoDAkg)
+bot = Bot(AAEP2M_TorpiZy5ucYdUFIuY1rISAAoDAkg)
 dp = Dispatcher()
 
 # Открытые обращения:
