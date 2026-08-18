@@ -1,10 +1,12 @@
 import os
 import asyncio
 import time
+import sqlite3
+from contextlib import closing
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -17,11 +19,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "❌ BOT_TOKEN не найден! "
-        "Добавь BOT_TOKEN в Environment Variables на Render."
+        "BOT_TOKEN не найден! Добавь BOT_TOKEN в Environment Variables на Render."
     )
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1706479196"))
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "1706479196"))
+except ValueError:
+    raise RuntimeError("ADMIN_ID должен быть числом.")
+
+DB_PATH = os.getenv("DB_PATH", "support_bot.db")
+
+ANTI_SPAM_LIMIT = 5
+ANTI_SPAM_SECONDS = 10
+AUTO_MUTE_SECONDS = 60
 
 
 # =========================================================
@@ -33,57 +43,233 @@ dp = Dispatcher()
 
 
 # =========================================================
-# ТИКЕТЫ
+# SQLITE
 # =========================================================
 
-# user_id -> True
-tickets = {}
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-# Админ сейчас отвечает пользователю:
-# admin_id -> user_id
-reply_mode = {}
+def init_db():
+    with closing(db_connect()) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS mutes (
+                user_id INTEGER PRIMARY KEY,
+                mute_until REAL
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        for key in (
+            "tickets_created",
+            "tickets_closed",
+            "messages_received",
+            "messages_sent",
+            "auto_mutes",
+        ):
+            db.execute(
+                "INSERT OR IGNORE INTO stats(key, value) VALUES(?, 0)",
+                (key,)
+            )
+
+        db.commit()
+
+
+def stat_inc(key: str, amount: int = 1):
+    with closing(db_connect()) as db:
+        db.execute(
+            "UPDATE stats SET value = value + ? WHERE key = ?",
+            (amount, key)
+        )
+        db.commit()
+
+
+def stat_get(key: str) -> int:
+    with closing(db_connect()) as db:
+        row = db.execute(
+            "SELECT value FROM stats WHERE key = ?",
+            (key,)
+        ).fetchone()
+
+    return int(row["value"]) if row else 0
+
+
+# =========================================================
+# TICKETS
+# =========================================================
+
+def ticket_exists(user_id: int) -> bool:
+    with closing(db_connect()) as db:
+        row = db.execute(
+            "SELECT 1 FROM tickets WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+    return row is not None
+
+
+def create_ticket(user_id: int, full_name: str, username: str | None):
+    with closing(db_connect()) as db:
+        db.execute(
+            """
+            INSERT OR REPLACE INTO tickets
+            (user_id, full_name, username, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, full_name, username, time.time())
+        )
+        db.commit()
+
+    stat_inc("tickets_created")
+
+
+def close_ticket_db(user_id: int):
+    with closing(db_connect()) as db:
+        db.execute(
+            "DELETE FROM tickets WHERE user_id = ?",
+            (user_id,)
+        )
+        db.commit()
+
+    stat_inc("tickets_closed")
+
+
+def get_ticket(user_id: int):
+    with closing(db_connect()) as db:
+        return db.execute(
+            "SELECT * FROM tickets WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+
+def get_open_tickets():
+    with closing(db_connect()) as db:
+        return db.execute(
+            "SELECT * FROM tickets ORDER BY created_at ASC"
+        ).fetchall()
 
 
 # =========================================================
 # MUTE
 # =========================================================
 
-# user_id -> timestamp окончания мута
-#
-# Например:
-# 123456789 -> 1755555555
-#
-# Если текущее время меньше timestamp,
-# пользователь находится в муте.
-muted_users = {}
+def set_mute(user_id: int, duration: int):
+    # duration == 0 = permanent
+    mute_until = None if duration == 0 else time.time() + duration
+
+    with closing(db_connect()) as db:
+        db.execute(
+            """
+            INSERT OR REPLACE INTO mutes(user_id, mute_until)
+            VALUES (?, ?)
+            """,
+            (user_id, mute_until)
+        )
+        db.commit()
+
+
+def remove_mute(user_id: int):
+    with closing(db_connect()) as db:
+        db.execute(
+            "DELETE FROM mutes WHERE user_id = ?",
+            (user_id,)
+        )
+        db.commit()
+
+
+def is_muted(user_id: int) -> bool:
+    with closing(db_connect()) as db:
+        row = db.execute(
+            "SELECT mute_until FROM mutes WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+    if not row:
+        return False
+
+    # NULL = permanent mute
+    if row["mute_until"] is None:
+        return True
+
+    if time.time() >= float(row["mute_until"]):
+        remove_mute(user_id)
+        return False
+
+    return True
+
+
+def get_mute_remaining(user_id: int) -> int:
+    with closing(db_connect()) as db:
+        row = db.execute(
+            "SELECT mute_until FROM mutes WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+    if not row:
+        return 0
+
+    if row["mute_until"] is None:
+        return -1
+
+    return max(0, int(float(row["mute_until"]) - time.time()))
 
 
 # =========================================================
-# АНТИСПАМ
+# REPLY MODE
 # =========================================================
 
-# user_id -> список времени последних сообщений
-message_times = {}
-
-# Максимальное количество сообщений
-# за указанное количество секунд.
-ANTI_SPAM_LIMIT = 5
-ANTI_SPAM_SECONDS = 10
-
-# Автоматический мут при превышении лимита
-AUTO_MUTE_SECONDS = 60
+# admin_id -> user_id
+reply_mode: dict[int, int] = {}
 
 
 # =========================================================
-# ФОРМАТИРОВАНИЕ ВРЕМЕНИ
+# ANTI-SPAM
+# =========================================================
+
+message_times: dict[int, list[float]] = {}
+
+
+def check_antispam(user_id: int) -> bool:
+    now = time.time()
+
+    history = message_times.setdefault(user_id, [])
+
+    history[:] = [
+        t for t in history
+        if now - t < ANTI_SPAM_SECONDS
+    ]
+
+    history.append(now)
+
+    if len(history) > ANTI_SPAM_LIMIT:
+        history.clear()
+        return True
+
+    return False
+
+
+# =========================================================
+# ФОРМАТИРОВАНИЕ
 # =========================================================
 
 def format_duration(seconds: int) -> str:
-    """
-    Перевод секунд в красивый текст.
-    """
-
     if seconds < 60:
         return f"{seconds} сек."
 
@@ -98,49 +284,25 @@ def format_duration(seconds: int) -> str:
         return f"{hours} ч."
 
     days = hours // 24
-
     return f"{days} д."
 
 
-# =========================================================
-# ПРОВЕРКА MUTE
-# =========================================================
+def user_label(user_id: int) -> str:
+    ticket = get_ticket(user_id)
 
-def is_muted(user_id: int) -> bool:
-    """
-    Проверяет, находится ли пользователь в муте.
-    """
+    if not ticket:
+        return f"ID {user_id}"
 
-    if user_id not in muted_users:
-        return False
+    username = ticket["username"]
 
-    mute_until = muted_users[user_id]
+    if username:
+        return f'{ticket["full_name"]} (@{username})'
 
-    # Мут закончился
-    if time.time() >= mute_until:
-        muted_users.pop(user_id, None)
-        return False
-
-    return True
-
-
-def get_mute_remaining(user_id: int) -> int:
-    """
-    Возвращает оставшееся время мута.
-    """
-
-    if user_id not in muted_users:
-        return 0
-
-    remaining = int(
-        muted_users[user_id] - time.time()
-    )
-
-    return max(remaining, 0)
+    return ticket["full_name"]
 
 
 # =========================================================
-# КЛАВИАТУРА ГЛАВНОГО МЕНЮ
+# КЛАВИАТУРЫ
 # =========================================================
 
 def main_menu():
@@ -151,12 +313,15 @@ def main_menu():
         callback_data="create_ticket"
     )
 
+    kb.button(
+        text="📊 Статус обращения",
+        callback_data="ticket_status"
+    )
+
+    kb.adjust(1)
+
     return kb.as_markup()
 
-
-# =========================================================
-# КНОПКИ ТИКЕТА
-# =========================================================
 
 def ticket_buttons(user_id: int):
     kb = InlineKeyboardBuilder()
@@ -164,6 +329,11 @@ def ticket_buttons(user_id: int):
     kb.button(
         text="💬 Ответить",
         callback_data=f"reply:{user_id}"
+    )
+
+    kb.button(
+        text="👤 Информация",
+        callback_data=f"info:{user_id}"
     )
 
     kb.button(
@@ -181,14 +351,10 @@ def ticket_buttons(user_id: int):
         callback_data=f"close:{user_id}"
     )
 
-    kb.adjust(2, 2)
+    kb.adjust(2, 2, 1)
 
     return kb.as_markup()
 
-
-# =========================================================
-# КНОПКИ ВЫБОРА МУТА
-# =========================================================
 
 def mute_duration_keyboard(user_id: int):
     kb = InlineKeyboardBuilder()
@@ -223,74 +389,228 @@ def mute_duration_keyboard(user_id: int):
     return kb.as_markup()
 
 
+def cancel_reply_keyboard():
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="❌ Отменить ответ",
+        callback_data="cancel_reply"
+    )
+
+    return kb.as_markup()
+
+
+def ticket_list_keyboard():
+    kb = InlineKeyboardBuilder()
+
+    for ticket in get_open_tickets():
+        uid = int(ticket["user_id"])
+        name = ticket["full_name"][:28]
+
+        kb.button(
+            text=f"🎫 {name}",
+            callback_data=f"reply:{uid}"
+        )
+
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 # =========================================================
 # START
 # =========================================================
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer(
+            "👨‍💼 Панель администратора\n\n"
+            "Используй:\n"
+            "/tickets — открытые обращения\n"
+            "/stats — статистика\n"
+            "/cancel — выйти из режима ответа"
+        )
+        return
+
     await message.answer(
         "👋 Добро пожаловать в Support!\n\n"
         "Если у тебя возникла проблема, "
-        "нажми кнопку ниже 👇",
+        "создай обращение и напиши подробно, "
+        "что произошло.",
         reply_markup=main_menu()
     )
 
 
 # =========================================================
-# СОЗДАНИЕ ТИКЕТА
+# CREATE TICKET
 # =========================================================
 
 @dp.callback_query(F.data == "create_ticket")
 async def create_ticket(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    # Если уже есть тикет
-    if user_id in tickets:
+    if is_muted(user_id):
+        remaining = get_mute_remaining(user_id)
+
+        if remaining == -1:
+            text = (
+                "🔇 Ты находишься в постоянном муте.\n\n"
+                "Твои сообщения не передаются в поддержку."
+            )
+        else:
+            text = (
+                "🔇 Ты находишься в муте.\n\n"
+                f"⏱ Осталось: {format_duration(remaining)}"
+            )
+
+        await callback.answer(text, show_alert=True)
+        return
+
+    if ticket_exists(user_id):
         await callback.answer(
             "У тебя уже есть открытое обращение.",
             show_alert=True
         )
         return
 
-    tickets[user_id] = True
+    create_ticket(
+        user_id,
+        callback.from_user.full_name,
+        callback.from_user.username
+    )
 
     await callback.message.answer(
         "📩 Обращение создано!\n\n"
-        "Опиши свою проблему одним или несколькими сообщениями."
+        "Опиши проблему одним или несколькими сообщениями.\n"
+        "После этого дождись ответа поддержки."
+    )
+
+    username = (
+        f"@{callback.from_user.username}"
+        if callback.from_user.username
+        else "нет username"
     )
 
     await bot.send_message(
         ADMIN_ID,
         "🎫 НОВОЕ ОБРАЩЕНИЕ\n\n"
-        f"👤 Пользователь: {callback.from_user.full_name}\n"
+        f"👤 {callback.from_user.full_name}\n"
+        f"🔗 {username}\n"
         f"🆔 ID: {user_id}\n\n"
         "💬 Ожидаю сообщение от пользователя.",
         reply_markup=ticket_buttons(user_id)
     )
 
+    await callback.answer("✅ Обращение создано!")
+
+
+# =========================================================
+# TICKET STATUS
+# =========================================================
+
+@dp.callback_query(F.data == "ticket_status")
+async def ticket_status(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    if ticket_exists(user_id):
+        await callback.answer(
+            "🎫 У тебя есть открытое обращение.",
+            show_alert=True
+        )
+    else:
+        await callback.answer(
+            "📭 У тебя нет открытого обращения.",
+            show_alert=True
+        )
+
+
+# =========================================================
+# ADMIN: TICKETS
+# =========================================================
+
+@dp.message(Command("tickets"))
+async def admin_tickets(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    tickets_list = get_open_tickets()
+
+    if not tickets_list:
+        await message.answer("📭 Открытых обращений нет.")
+        return
+
+    text = (
+        f"🎫 Открытые обращения: {len(tickets_list)}\n\n"
+        "Нажми на пользователя, чтобы включить режим ответа:"
+    )
+
+    await message.answer(
+        text,
+        reply_markup=ticket_list_keyboard()
+    )
+
+
+# =========================================================
+# ADMIN: STATS
+# =========================================================
+
+@dp.message(Command("stats"))
+async def admin_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    open_count = len(get_open_tickets())
+
+    await message.answer(
+        "📊 СТАТИСТИКА SUPPORT\n\n"
+        f"🎫 Создано тикетов: {stat_get('tickets_created')}\n"
+        f"🔒 Закрыто тикетов: {stat_get('tickets_closed')}\n"
+        f"📨 Получено сообщений: {stat_get('messages_received')}\n"
+        f"📤 Отправлено сообщений: {stat_get('messages_sent')}\n"
+        f"🚨 Автомутов: {stat_get('auto_mutes')}\n"
+        f"📂 Открыто сейчас: {open_count}"
+    )
+
+
+# =========================================================
+# ADMIN: CANCEL
+# =========================================================
+
+@dp.message(Command("cancel"))
+async def admin_cancel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    reply_mode.pop(ADMIN_ID, None)
+
+    await message.answer("❌ Режим ответа отключён.")
+
+
+@dp.callback_query(F.data == "cancel_reply")
+async def cancel_reply(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа.", show_alert=True)
+        return
+
+    reply_mode.pop(ADMIN_ID, None)
+
+    await callback.message.answer("❌ Режим ответа отключён.")
     await callback.answer()
 
 
 # =========================================================
-# КНОПКА "ОТВЕТИТЬ"
+# ADMIN: REPLY
 # =========================================================
 
 @dp.callback_query(F.data.startswith("reply:"))
 async def reply_ticket(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
+        await callback.answer("❌ Нет доступа.", show_alert=True)
         return
 
-    user_id = int(
-        callback.data.split(":")[1]
-    )
+    user_id = int(callback.data.split(":")[1])
 
-    if user_id not in tickets:
+    if not ticket_exists(user_id):
         await callback.answer(
             "❌ Обращение уже закрыто.",
             show_alert=True
@@ -300,33 +620,79 @@ async def reply_ticket(callback: CallbackQuery):
     reply_mode[ADMIN_ID] = user_id
 
     await callback.message.answer(
-        "💬 Режим ответа включён.\n\n"
-        f"👤 Пользователь ID: {user_id}\n\n"
-        "✏️ Напиши сообщение, которое хочешь отправить пользователю."
+        "💬 РЕЖИМ ОТВЕТА ВКЛЮЧЁН\n\n"
+        f"👤 Пользователь: {user_label(user_id)}\n"
+        f"🆔 ID: {user_id}\n\n"
+        "Теперь отправь сообщение, фото, видео, файл или другой поддерживаемый тип сообщения.\n"
+        "Оно будет передано пользователю.",
+        reply_markup=cancel_reply_keyboard()
     )
 
     await callback.answer()
 
 
 # =========================================================
-# КНОПКА "MUTE"
+# ADMIN: USER INFO
 # =========================================================
 
-@dp.callback_query(F.data.startswith("mute:"))
-async def mute_menu(callback: CallbackQuery):
-
+@dp.callback_query(F.data.startswith("info:"))
+async def user_info(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":")[1])
+    ticket = get_ticket(user_id)
+
+    if not ticket:
         await callback.answer(
-            "❌ Нет доступа.",
+            "❌ Тикет не найден.",
             show_alert=True
         )
         return
 
-    user_id = int(
-        callback.data.split(":")[1]
+    username = (
+        f"@{ticket['username']}"
+        if ticket["username"]
+        else "нет"
     )
 
-    if user_id not in tickets:
+    created = time.strftime(
+        "%d.%m.%Y %H:%M:%S",
+        time.localtime(ticket["created_at"])
+    )
+
+    mute = "нет"
+
+    if is_muted(user_id):
+        remaining = get_mute_remaining(user_id)
+        mute = "навсегда" if remaining == -1 else format_duration(remaining)
+
+    await callback.message.answer(
+        "👤 ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ\n\n"
+        f"Имя: {ticket['full_name']}\n"
+        f"Username: {username}\n"
+        f"ID: {user_id}\n"
+        f"🎫 Создан: {created}\n"
+        f"🔇 Мут: {mute}"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ADMIN: MUTE MENU
+# =========================================================
+
+@dp.callback_query(F.data.startswith("mute:"))
+async def mute_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":")[1])
+
+    if not ticket_exists(user_id):
         await callback.answer(
             "❌ Обращение уже закрыто.",
             show_alert=True
@@ -334,8 +700,8 @@ async def mute_menu(callback: CallbackQuery):
         return
 
     await callback.message.answer(
-        "🔇 Выбери длительность мута:\n\n"
-        f"👤 Пользователь: {user_id}",
+        "🔇 ВЫБЕРИ ДЛИТЕЛЬНОСТЬ МУТА\n\n"
+        f"👤 Пользователь: {user_label(user_id)}",
         reply_markup=mute_duration_keyboard(user_id)
     )
 
@@ -343,17 +709,13 @@ async def mute_menu(callback: CallbackQuery):
 
 
 # =========================================================
-# ВЫБОР ВРЕМЕНИ MUTE
+# ADMIN: SET MUTE
 # =========================================================
 
 @dp.callback_query(F.data.startswith("mutetime:"))
-async def set_mute(callback: CallbackQuery):
-
+async def set_mute_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
+        await callback.answer("❌ Нет доступа.", show_alert=True)
         return
 
     parts = callback.data.split(":")
@@ -361,324 +723,218 @@ async def set_mute(callback: CallbackQuery):
     user_id = int(parts[1])
     duration = int(parts[2])
 
-    if user_id not in tickets:
+    if not ticket_exists(user_id):
         await callback.answer(
             "❌ Обращение уже закрыто.",
             show_alert=True
         )
         return
 
-    # =====================================================
-    # МУТ НАВСЕГДА
-    # =====================================================
+    set_mute(user_id, duration)
 
     if duration == 0:
-
-        # Очень далёкая дата = фактически навсегда
-        muted_users[user_id] = time.time() + (365 * 24 * 60 * 60)
-
         duration_text = "навсегда"
-
     else:
-
-        muted_users[user_id] = (
-            time.time() + duration
-        )
-
         duration_text = format_duration(duration)
 
-    # =====================================================
-    # Уведомляем пользователя
-    # =====================================================
-
     try:
-
         await bot.send_message(
             user_id,
-            "🔇 Вы были временно ограничены в отправке сообщений.\n\n"
+            "🔇 ОГРАНИЧЕНИЕ\n\n"
             f"⏱ Длительность: {duration_text}\n\n"
-            "Пока ограничение действует, ваши сообщения "
-            "не будут передаваться в поддержку."
+            "Пока ограничение действует, "
+            "сообщения в поддержку передаваться не будут."
         )
-
     except Exception:
         pass
-
-    # =====================================================
-    # Уведомляем админа
-    # =====================================================
 
     await callback.message.answer(
         "🔇 Пользователь замьючен.\n\n"
         f"👤 ID: {user_id}\n"
-        f"⏱ Время: {duration_text}"
+        f"⏱ Срок: {duration_text}"
     )
 
-    await callback.answer(
-        "🔇 Пользователь замьючен."
-    )
+    await callback.answer("🔇 Мут установлен.")
 
 
 # =========================================================
-# КНОПКА "UNMUTE"
+# ADMIN: UNMUTE
 # =========================================================
 
 @dp.callback_query(F.data.startswith("unmute:"))
 async def unmute_user(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
+        await callback.answer("❌ Нет доступа.", show_alert=True)
         return
 
-    user_id = int(
-        callback.data.split(":")[1]
-    )
+    user_id = int(callback.data.split(":")[1])
 
-    if user_id not in muted_users:
+    if not is_muted(user_id):
         await callback.answer(
             "ℹ️ Пользователь не находится в муте.",
             show_alert=True
         )
         return
 
-    muted_users.pop(
-        user_id,
-        None
-    )
+    remove_mute(user_id)
 
     try:
-
         await bot.send_message(
             user_id,
-            "🔊 Ограничение снято!\n\n"
-            "Теперь ты снова можешь отправлять сообщения "
-            "в поддержку."
+            "🔊 ОГРАНИЧЕНИЕ СНЯТО\n\n"
+            "Теперь ты снова можешь отправлять сообщения в поддержку."
         )
-
     except Exception:
         pass
 
     await callback.message.answer(
-        "🔊 Пользователь размьючен.\n\n"
+        "🔊 Мут снят.\n\n"
         f"👤 ID: {user_id}"
     )
 
-    await callback.answer(
-        "🔊 Мут снят."
-    )
+    await callback.answer("🔊 Мут снят.")
 
 
 # =========================================================
-# КНОПКА "ЗАКРЫТЬ"
+# ADMIN: CLOSE
 # =========================================================
 
 @dp.callback_query(F.data.startswith("close:"))
-async def close_ticket(callback: CallbackQuery):
-
+async def close_ticket_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":")[1])
+
+    if not ticket_exists(user_id):
         await callback.answer(
-            "❌ Нет доступа.",
+            "❌ Обращение уже закрыто.",
             show_alert=True
         )
         return
 
-    user_id = int(
-        callback.data.split(":")[1]
-    )
-
-    tickets.pop(
-        user_id,
-        None
-    )
-
-    reply_mode.pop(
-        ADMIN_ID,
-        None
-    )
-
-    muted_users.pop(
-        user_id,
-        None
-    )
+    close_ticket_db(user_id)
+    remove_mute(user_id)
+    reply_mode.pop(ADMIN_ID, None)
 
     try:
-
         await bot.send_message(
             user_id,
-            "🔒 Ваше обращение было закрыто.\n\n"
-            "Если у вас появилась новая проблема, "
-            "вы можете создать новое обращение."
+            "🔒 ОБРАЩЕНИЕ ЗАКРЫТО\n\n"
+            "Если у тебя появилась новая проблема, "
+            "можешь создать новое обращение.",
+            reply_markup=main_menu()
         )
-
     except Exception:
         pass
 
     await callback.message.answer(
-        "✅ Обращение закрыто."
+        f"✅ Обращение пользователя {user_id} закрыто."
     )
 
-    await callback.answer()
+    await callback.answer("🔒 Тикет закрыт.")
 
 
 # =========================================================
-# СООБЩЕНИЯ ОТ АДМИНА
+# ADMIN MESSAGES
 # =========================================================
 
 @dp.message(F.chat.id == ADMIN_ID)
 async def admin_message(message: Message):
-
     admin_id = message.from_user.id
 
+    # Команды обрабатываются отдельными handlers
+    if message.text and message.text.startswith("/"):
+        return
+
     if admin_id not in reply_mode:
-
         await message.answer(
-            "📋 Выбери обращение и нажми "
-            "«💬 Ответить»."
+            "📋 Выбери обращение через /tickets "
+            "или нажми «💬 Ответить»."
         )
-
         return
 
     user_id = reply_mode[admin_id]
 
-    if user_id not in tickets:
-
-        await message.answer(
-            "❌ Это обращение уже закрыто."
-        )
-
-        reply_mode.pop(
-            admin_id,
-            None
-        )
-
-        return
-
-    # Если пользователь в муте,
-    # админ всё равно может ему отвечать.
-    # Mute блокирует только сообщения пользователя.
-
-    if not message.text:
-
-        await message.answer(
-            "⚠️ Пока поддерживаются только текстовые сообщения."
-        )
-
+    if not ticket_exists(user_id):
+        await message.answer("❌ Это обращение уже закрыто.")
+        reply_mode.pop(admin_id, None)
         return
 
     try:
-
-        await bot.send_message(
-            user_id,
-            "👨‍💼 Ответ поддержки:\n\n"
-            f"{message.text}"
+        # Копируем практически любой тип сообщения:
+        # текст, фото, видео, документ, стикер и т.д.
+        await bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=ADMIN_ID,
+            message_id=message.message_id
         )
 
+        stat_inc("messages_sent")
+
         await message.answer(
-            "✅ Ответ отправлен пользователю."
+            "✅ Сообщение отправлено пользователю."
         )
 
     except Exception as e:
-
         await message.answer(
-            f"❌ Не удалось отправить сообщение.\n\n"
+            "❌ Не удалось отправить сообщение.\n\n"
             f"{e}"
         )
 
 
 # =========================================================
-# СООБЩЕНИЯ ОТ ПОЛЬЗОВАТЕЛЯ
+# USER MESSAGES
 # =========================================================
 
 @dp.message()
 async def user_message(message: Message):
-
     user_id = message.from_user.id
-
-    # =====================================================
-    # АДМИН
-    # =====================================================
 
     if user_id == ADMIN_ID:
         return
 
-    # =====================================================
-    # ПРОВЕРКА MUTE
-    # =====================================================
+    stat_inc("messages_received")
+
+    # -----------------------------------------------------
+    # MUTE
+    # -----------------------------------------------------
 
     if is_muted(user_id):
+        remaining = get_mute_remaining(user_id)
 
-        remaining = get_mute_remaining(
-            user_id
-        )
-
-        await message.answer(
-            "🔇 Ты сейчас находишься в муте.\n\n"
-            f"⏱ Осталось: {format_duration(remaining)}\n\n"
-            "Твои сообщения пока не передаются в поддержку."
-        )
+        if remaining == -1:
+            await message.answer(
+                "🔇 Ты находишься в постоянном муте.\n\n"
+                "Твои сообщения не передаются в поддержку."
+            )
+        else:
+            await message.answer(
+                "🔇 Ты сейчас находишься в муте.\n\n"
+                f"⏱ Осталось: {format_duration(remaining)}"
+            )
 
         return
 
-    # =====================================================
-    # ПРОВЕРКА ТИКЕТА
-    # =====================================================
+    # -----------------------------------------------------
+    # TICKET
+    # -----------------------------------------------------
 
-    if user_id not in tickets:
-
+    if not ticket_exists(user_id):
         await message.answer(
             "❗ Сначала создай обращение.",
             reply_markup=main_menu()
         )
-
         return
 
-    # =====================================================
-    # ТОЛЬКО ТЕКСТ
-    # =====================================================
+    # -----------------------------------------------------
+    # ANTISPAM
+    # -----------------------------------------------------
 
-    if not message.text:
-
-        await message.answer(
-            "⚠️ Пока поддерживаются только текстовые сообщения."
-        )
-
-        return
-
-    # =====================================================
-    # АНТИСПАМ
-    # =====================================================
-
-    current_time = time.time()
-
-    if user_id not in message_times:
-        message_times[user_id] = []
-
-    # Оставляем только сообщения за последние N секунд
-    message_times[user_id] = [
-        msg_time
-        for msg_time in message_times[user_id]
-        if current_time - msg_time < ANTI_SPAM_SECONDS
-    ]
-
-    message_times[user_id].append(
-        current_time
-    )
-
-    # =====================================================
-    # ПРЕВЫШЕН ЛИМИТ
-    # =====================================================
-
-    if len(message_times[user_id]) > ANTI_SPAM_LIMIT:
-
-        muted_users[user_id] = (
-            current_time + AUTO_MUTE_SECONDS
-        )
-
-        # Очищаем историю сообщений
-        message_times[user_id] = []
+    if check_antispam(user_id):
+        set_mute(user_id, AUTO_MUTE_SECONDS)
+        stat_inc("auto_mutes")
 
         await message.answer(
             "⚠️ Слишком много сообщений подряд.\n\n"
@@ -687,37 +943,70 @@ async def user_message(message: Message):
             "Пожалуйста, подожди."
         )
 
-        await bot.send_message(
-            ADMIN_ID,
-            "🚨 АВТОМАТИЧЕСКИЙ АНТИСПАМ\n\n"
-            f"👤 Пользователь: {message.from_user.full_name}\n"
-            f"🆔 ID: {user_id}\n\n"
-            f"🔇 Мут: {format_duration(AUTO_MUTE_SECONDS)}"
-        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "🚨 АВТОМАТИЧЕСКИЙ АНТИСПАМ\n\n"
+                f"👤 {message.from_user.full_name}\n"
+                f"🆔 ID: {user_id}\n"
+                f"🔇 Мут: {format_duration(AUTO_MUTE_SECONDS)}",
+                reply_markup=ticket_buttons(user_id)
+            )
+        except Exception:
+            pass
 
         return
 
-    # =====================================================
-    # ОТПРАВЛЯЕМ СООБЩЕНИЕ АДМИНУ
-    # =====================================================
+    # -----------------------------------------------------
+    # SEND MESSAGE TO ADMIN
+    # -----------------------------------------------------
 
-    await bot.send_message(
-        ADMIN_ID,
-        "📨 СООБЩЕНИЕ В ТИКЕТЕ\n\n"
-        f"👤 {message.from_user.full_name}\n"
-        f"🆔 ID: {user_id}\n\n"
-        f"💬 {message.text}",
-        reply_markup=ticket_buttons(user_id)
-    )
+    try:
+        username = (
+            f"@{message.from_user.username}"
+            if message.from_user.username
+            else "нет username"
+        )
 
-    # =====================================================
-    # ПОДТВЕРЖДЕНИЕ
-    # =====================================================
+        await bot.send_message(
+            ADMIN_ID,
+            "📨 НОВОЕ СООБЩЕНИЕ В ТИКЕТЕ\n\n"
+            f"👤 {message.from_user.full_name}\n"
+            f"🔗 {username}\n"
+            f"🆔 ID: {user_id}"
+        )
 
-    await message.answer(
-        "📨 Сообщение отправлено в поддержку.\n"
-        "⏳ Ожидай ответа."
-    )
+        # Копируем оригинальное сообщение:
+        # фото / видео / файл / текст / стикер и т.д.
+        await bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=user_id,
+            message_id=message.message_id
+        )
+
+        await bot.send_message(
+            ADMIN_ID,
+            "🎫 Управление тикетом:",
+            reply_markup=ticket_buttons(user_id)
+        )
+
+        await message.answer(
+            "📨 Сообщение отправлено в поддержку.\n"
+            "⏳ Ожидай ответа."
+        )
+
+    except Exception as e:
+        await message.answer(
+            "❌ Не удалось передать сообщение в поддержку."
+        )
+
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Ошибка передачи сообщения пользователя {user_id}:\n{e}"
+            )
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -725,7 +1014,6 @@ async def user_message(message: Message):
 # =========================================================
 
 async def health(request):
-
     return web.Response(
         text="Support bot is running!"
     )
@@ -736,31 +1024,17 @@ async def health(request):
 # =========================================================
 
 async def main():
-
-    # =====================================================
-    # WEB SERVER ДЛЯ RENDER
-    # =====================================================
+    init_db()
 
     app = web.Application()
 
-    app.router.add_get(
-        "/",
-        health
-    )
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
 
-    runner = web.AppRunner(
-        app
-    )
-
+    runner = web.AppRunner(app)
     await runner.setup()
 
-    # Render передаёт PORT
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     site = web.TCPSite(
         runner,
@@ -771,25 +1045,22 @@ async def main():
     await site.start()
 
     print("================================")
-    print("✅ SUPPORT BOT ЗАПУЩЕН")
+    print("✅ SUPPORT BOT V2 ЗАПУЩЕН")
     print(f"🌐 Port: {port}")
     print(f"👨‍💼 Admin ID: {ADMIN_ID}")
+    print("💾 SQLite: ON")
     print("🛡 Anti-Spam: ON")
     print("🔇 Mute: ON")
+    print("🎫 Tickets: ON")
+    print("📊 Stats: ON")
+    print("📎 Media: ON")
     print("================================")
 
-    # =====================================================
-    # TELEGRAM POLLING
-    # =====================================================
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
-    await dp.start_polling(
-        bot
-    )
-
-
-# =========================================================
-# ЗАПУСК
-# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
