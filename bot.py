@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import sqlite3
+import urllib.request
 from contextlib import closing
 
 from aiohttp import web
@@ -1974,6 +1975,58 @@ async def health(request):
 
 
 # =========================================================
+# KEEP ALIVE FOR RENDER FREE WEB SERVICE
+# =========================================================
+
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "600"))
+
+
+async def keep_alive():
+    """
+    Sends an HTTP request to this Render service every 10 minutes.
+
+    Render provides RENDER_EXTERNAL_URL automatically for web services.
+    If it is not available (for example, local development), keep-alive
+    is disabled and the bot continues to work normally.
+    """
+    base_url = os.getenv("RENDER_EXTERNAL_URL")
+
+    if not base_url:
+        print("ℹ️ RENDER_EXTERNAL_URL не найден — Keep-Alive отключён.")
+        return
+
+    health_url = base_url.rstrip("/") + "/health"
+
+    print(
+        f"🟢 Render Keep-Alive включён: каждые "
+        f"{KEEP_ALIVE_INTERVAL} сек. → {health_url}"
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+
+            def ping():
+                request = urllib.request.Request(
+                    health_url,
+                    headers={"User-Agent": "SupportBot-Render-KeepAlive/1.0"}
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status
+
+            status = await asyncio.to_thread(ping)
+
+            print(f"💓 Keep-Alive: HTTP {status}")
+
+        except asyncio.CancelledError:
+            print("🛑 Render Keep-Alive остановлен.")
+            raise
+
+        except Exception as e:
+            print(f"⚠️ Keep-Alive ошибка: {e}")
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -1998,6 +2051,9 @@ async def main():
         port
     )
     await site.start()
+
+    # Keep the Render Free Web Service active.
+    keep_alive_task = asyncio.create_task(keep_alive())
 
     print("================================")
     print("✅ SUPPORT BOT V3 ЗАПУЩЕН")
@@ -2026,6 +2082,14 @@ async def main():
         )
         raise
     finally:
+        keep_alive_task.cancel()
+
+        try:
+            await keep_alive_task
+        except asyncio.CancelledError:
+            pass
+
+        await runner.cleanup()
         await bot.session.close()
 
 
