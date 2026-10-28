@@ -233,6 +233,18 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await show_shop_message(update.effective_message.reply_text, update.effective_message)
 
 
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_user(update)
+    if update.effective_user:
+        await profile(update, context, update.effective_user.id)
+
+
+async def myorders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_user(update)
+    if update.effective_user:
+        await orders(update, context, update.effective_user.id)
+
+
 async def show_shop_message(_reply_func, message) -> None:
     with db_connect() as conn:
         products = conn.execute(
@@ -428,18 +440,21 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.effective_user or not is_admin(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Admin only.")
         return
+    # Keep this help text plain: underscores in PRODUCT_ID and TELEGRAM_USER_ID
+    # are interpreted as Markdown formatting and can make Telegram reject it.
     await update.effective_message.reply_text(
-        "🛠 *Admin commands*\n\n"
+        "🛠 ADMIN COMMANDS\n\n"
         "/addproduct PRICE | NAME | DESCRIPTION\n"
         "/addstock PRODUCT_ID | ITEM1 || ITEM2 || ITEM3\n"
-        "/products — list products and stock\n"
-        "/delproduct PRODUCT_ID — hide a product\n"
+        "/products - list products and stock\n"
+        "/delproduct PRODUCT_ID - hide a product\n"
         "/setprice PRODUCT_ID | PRICE\n"
-        "/orders [TELEGRAM_USER_ID] — recent orders\n"
-        "/adminhelp — this help\n\n"
-        "Example:\n`/addproduct 9.99 | Game Key | Key for the game`\n"
-        "`/addstock 1 | ABCD-EFGH || IJKL-MNOP`",
-        parse_mode="Markdown",
+        "/orders [TELEGRAM_USER_ID] - recent orders\n"
+        "/resend ORDER_ID - resend a paid order\n"
+        "/adminhelp - show this help\n\n"
+        "Examples:\n"
+        "/addproduct 9.99 | Game Key | Key for the game\n"
+        "/addstock 1 | ABCD-EFGH || IJKL-MNOP"
     )
 
 
@@ -717,6 +732,7 @@ async def post_init(application: Application) -> None:
 
     app = web.Application(client_max_size=1024 * 1024)
     app["telegram_application"] = application
+    app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
     app.router.add_post("/ipn", ipn_handler)
     runner = web.AppRunner(app)
@@ -747,8 +763,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("shop", shop_command))
-    application.add_handler(CommandHandler("profile", lambda u, c: profile(u, c, u.effective_user.id)))
-    application.add_handler(CommandHandler("myorders", lambda u, c: orders(u, c, u.effective_user.id)))
+    application.add_handler(CommandHandler("profile", profile_command))
+    application.add_handler(CommandHandler("myorders", myorders_command))
     application.add_handler(CommandHandler("adminhelp", admin_help))
     application.add_handler(CommandHandler("addproduct", addproduct))
     application.add_handler(CommandHandler("addstock", addstock))
