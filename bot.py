@@ -28,7 +28,7 @@ from telegram.ext import (
 # ============================================================
 # CONFIGURATION - set these as environment variables on hosting
 # ============================================================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9295443290:AAHWqfAlYeAPHSbPtqQjZdQNz4ggi6PGN8Y").strip()
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
 # Public HTTPS URL of this app, e.g. https://your-app.example.com
