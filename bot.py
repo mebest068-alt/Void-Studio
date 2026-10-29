@@ -81,6 +81,7 @@ def init_db() -> None:
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                balance TEXT NOT NULL DEFAULT '0.00',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS products (
@@ -118,6 +119,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_stock_product ON stock(product_id, delivered_order_id);
             """
         )
+        # Migrate existing databases created before wallet balance was added.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "balance" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN balance TEXT NOT NULL DEFAULT '0.00'")
 
 
 def remember_user(update: Update) -> None:
@@ -274,6 +279,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: i
     text = (
         "👤 *Your Profile*\n\n"
         f"Name: {name}\nUsername: {username}\nTelegram ID: `{user_id}`\n"
+        f"💰 Balance: {money(user['balance'] if user and user['balance'] else '0.00')}\n"
         f"Completed purchases: {totals['n'] if totals else 0}\n"
         f"Total spent: {Decimal(str(totals['total'] if totals else 0)):.2f} {PRICE_CURRENCY.upper()}"
     )
@@ -363,6 +369,61 @@ async def buy_product(query, context: ContextTypes.DEFAULT_TYPE, product_id: int
     )
 
 
+async def buy_with_balance(query, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """Atomically charge wallet balance, reserve one stock item, and create a delivered order."""
+    user = query.from_user
+    order_id = secrets.token_hex(8)
+    delivery_value = None
+    product_name = None
+    insufficient_balance = False
+    out_of_stock = False
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        product = conn.execute(
+            "SELECT * FROM products WHERE product_id=? AND active=1", (product_id,)
+        ).fetchone()
+        wallet = conn.execute("SELECT balance FROM users WHERE user_id=?", (user.id,)).fetchone()
+        if product is None:
+            await query.edit_message_text("This product is no longer available.", reply_markup=home_keyboard())
+            return
+        if wallet is None or Decimal(wallet["balance"] or "0.00") < Decimal(product["price"]):
+            insufficient_balance = True
+        else:
+            stock_item = conn.execute(
+                "SELECT stock_id, secret_value FROM stock WHERE product_id=? AND delivered_order_id IS NULL ORDER BY stock_id LIMIT 1",
+                (product_id,),
+            ).fetchone()
+            if stock_item is None:
+                out_of_stock = True
+            else:
+                new_balance = Decimal(wallet["balance"] or "0.00") - Decimal(product["price"])
+                conn.execute("UPDATE users SET balance=? WHERE user_id=?", (f"{new_balance:.2f}", user.id))
+                conn.execute(
+                    """INSERT INTO orders(order_id, user_id, product_id, product_name, price, price_currency,
+                       status, payment_status, delivered_at, created_at, updated_at)
+                       VALUES(?, ?, ?, ?, ?, ?, 'delivered', 'wallet', ?, ?, ?)""",
+                    (order_id, user.id, product_id, product["name"], product["price"], PRICE_CURRENCY, utc_now(), utc_now(), utc_now()),
+                )
+                conn.execute(
+                    "UPDATE stock SET delivered_order_id=? WHERE stock_id=? AND delivered_order_id IS NULL",
+                    (order_id, stock_item["stock_id"]),
+                )
+                delivery_value = stock_item["secret_value"]
+                product_name = product["name"]
+                balance_after = new_balance
+    if insufficient_balance:
+        await query.answer("Not enough balance. Contact support to top up your balance.", show_alert=True)
+        return
+    if out_of_stock:
+        await query.answer("This product is out of stock.", show_alert=True)
+        return
+    await query.edit_message_text(
+        f"✅ Purchase paid from your balance!\n\nProduct: {product_name}\nOrder: {order_id}\nRemaining balance: {money(f'{balance_after:.2f}')}\n\nYour digital item:\n{delivery_value}",
+        reply_markup=home_keyboard(),
+    )
+    await notify_admins(context.application, f"✅ Wallet order {order_id} completed; user ID: {user.id}; product: {product_name}.")
+
+
 async def check_order(query, order_id: str) -> None:
     with db_connect() as conn:
         row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
@@ -412,7 +473,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         keyboard_rows = []
         if available > 0:
-            keyboard_rows.append([InlineKeyboardButton("🛒 Buy", callback_data=f"buy:{product_id}")])
+            keyboard_rows.append([InlineKeyboardButton("🛒 Buy with crypto", callback_data=f"buy:{product_id}")])
+            keyboard_rows.append([InlineKeyboardButton("💰 Buy with balance", callback_data=f"walletbuy:{product_id}")])
         keyboard_rows += [[InlineKeyboardButton("⬅️ Back to shop", callback_data="shop")], [InlineKeyboardButton("🏠 Main menu", callback_data="home")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode="Markdown")
     elif data.startswith("buy:"):
@@ -421,6 +483,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except ValueError:
             return
         await buy_product(query, context, product_id)
+    elif data.startswith("walletbuy:"):
+        try:
+            product_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        await buy_with_balance(query, context, product_id)
     elif data == "profile":
         await profile(update, context, query.from_user.id)
     elif data == "orders":
@@ -449,6 +517,9 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/products - list products and stock\n"
         "/delproduct PRODUCT_ID - hide a product\n"
         "/setprice PRODUCT_ID | PRICE\n"
+        "/addbalance USER_ID AMOUNT - add money to a user's wallet\n"
+        "/setbalance USER_ID AMOUNT - set a user's wallet balance\n"
+        "/balance [USER_ID] - check wallet balance\n"
         "/orders [TELEGRAM_USER_ID] - recent orders\n"
         "/resend ORDER_ID - resend a paid order\n"
         "/adminhelp - show this help\n\n"
@@ -456,6 +527,86 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/addproduct 9.99 | Game Key | Key for the game\n"
         "/addstock 1 | ABCD-EFGH || IJKL-MNOP"
     )
+
+
+def parse_amount(raw: str) -> Decimal:
+    try:
+        amount = Decimal(raw).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        raise ValueError("Amount must be a valid number, e.g. 10 or 10.50.")
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Amount must be greater than zero.")
+    return amount
+
+
+async def addbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /addbalance USER_ID AMOUNT\nExample: /addbalance 123456789 10.00")
+        return
+    try:
+        target_id = int(context.args[0])
+        amount = parse_amount(context.args[1])
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO users(user_id, username, first_name, balance, created_at) VALUES(?, NULL, 'Customer', '0.00', ?) ON CONFLICT(user_id) DO NOTHING",
+            (target_id, utc_now()),
+        )
+        row = conn.execute("SELECT balance FROM users WHERE user_id=?", (target_id,)).fetchone()
+        new_balance = Decimal(row["balance"] or "0.00") + amount
+        conn.execute("UPDATE users SET balance=? WHERE user_id=?", (f"{new_balance:.2f}", target_id))
+    await update.effective_message.reply_text(f"✅ Added {money(f'{amount:.2f}')} to user {target_id}. New balance: {money(f'{new_balance:.2f}')}")
+    try:
+        await context.bot.send_message(target_id, f"💰 Your shop balance was topped up by {money(f'{amount:.2f}')}.\nCurrent balance: {money(f'{new_balance:.2f}')}")
+    except Exception:
+        logger.info("Could not notify user %s about wallet top-up", target_id)
+
+
+async def setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /setbalance USER_ID AMOUNT")
+        return
+    try:
+        target_id = int(context.args[0])
+        amount = parse_amount(context.args[1])
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO users(user_id, username, first_name, balance, created_at) VALUES(?, NULL, 'Customer', '0.00', ?) ON CONFLICT(user_id) DO NOTHING",
+            (target_id, utc_now()),
+        )
+        conn.execute("UPDATE users SET balance=? WHERE user_id=?", (f"{amount:.2f}", target_id))
+    await update.effective_message.reply_text(f"✅ User {target_id} balance set to {money(f'{amount:.2f}')}")
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user:
+        return
+    target_id = update.effective_user.id
+    if context.args:
+        if not is_admin(target_id):
+            await update.effective_message.reply_text("⛔ Only admins can check another user's balance.")
+            return
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("Usage: /balance [USER_ID]")
+            return
+    with db_connect() as conn:
+        row = conn.execute("SELECT balance FROM users WHERE user_id=?", (target_id,)).fetchone()
+    current = row["balance"] if row else "0.00"
+    await update.effective_message.reply_text(f"💰 User {target_id} balance: {money(current)}")
 
 
 def parse_parts(text: str, count: int) -> list[str]:
@@ -771,6 +922,9 @@ def main() -> None:
     application.add_handler(CommandHandler("products", products_command))
     application.add_handler(CommandHandler("delproduct", delproduct))
     application.add_handler(CommandHandler("setprice", setprice))
+    application.add_handler(CommandHandler("addbalance", addbalance))
+    application.add_handler(CommandHandler("setbalance", setbalance))
+    application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("orders", admin_orders))
     application.add_handler(CommandHandler("resend", resend_command))
     application.add_handler(CallbackQueryHandler(button_handler))
