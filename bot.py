@@ -28,18 +28,18 @@ from telegram.ext import (
 # ============================================================
 # CONFIGURATION - set these as environment variables on hosting
 # ============================================================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9295443290:AAHWqfAlYeAPHSbPtqQjZdQNz4ggi6PGN8Y").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
 # Public HTTPS URL of this app, e.g. https://your-app.example.com
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "Comming Soon").strip().rstrip("/")
 # Comma-separated Telegram numeric user IDs, e.g. 123456789,987654321
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "9119689776").split(",")
     if value.strip().isdigit()
 }
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@xpostu").strip().lstrip("@")
 PRICE_CURRENCY = os.getenv("PRICE_CURRENCY", "usd").strip().lower()
 PAY_CURRENCY = os.getenv("PAY_CURRENCY", "").strip().lower() or None
 DB_PATH = os.getenv("DB_PATH", "shop.sqlite3")
@@ -170,6 +170,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👤 Profile", callback_data="profile"),
          InlineKeyboardButton("📦 My Orders", callback_data="orders")],
         [InlineKeyboardButton("💬 Support", callback_data="support")],
+        [InlineKeyboardButton("ℹ️ How to buy", callback_data="howto")],
     ])
 
 
@@ -226,8 +227,8 @@ async def create_invoice(order_id: str, product_name: str, price: str) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     remember_user(update)
     await update.effective_message.reply_text(
-        "🛍️ *Welcome to our Digital Shop!*\n\n"
-        "Browse digital products, pay with cryptocurrency, and receive your purchase automatically after the payment is confirmed.",
+        "🚀 *Welcome to MSProject!*\n\n"
+        "Discover digital products, pay with crypto or your wallet balance, and receive your order automatically after payment confirmation.",
         reply_markup=home_keyboard(),
         parse_mode="Markdown",
     )
@@ -441,7 +442,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data or ""
 
     if data == "home":
-        await query.edit_message_text("🛍️ *Digital Shop*\nChoose an option:", reply_markup=home_keyboard(), parse_mode="Markdown")
+        await query.edit_message_text("🚀 *MSProject*\nChoose an option:", reply_markup=home_keyboard(), parse_mode="Markdown")
     elif data == "shop":
         with db_connect() as conn:
             products = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY product_id").fetchall()
@@ -493,6 +494,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await profile(update, context, query.from_user.id)
     elif data == "orders":
         await orders(update, context, query.from_user.id)
+    elif data == "howto":
+        guide = (
+            "ℹ️ *How to use MSProject*\n\n"
+            "1. Open *Shop* and choose a product.\n"
+            "2. Check the description, price, and stock.\n"
+            "3. Pay with cryptocurrency or your wallet balance.\n"
+            "4. After a crypto payment is confirmed, the bot delivers your item automatically.\n\n"
+            "💰 *Wallet balance:* contact support to request a top-up.\n"
+            "📦 *My Orders:* review your previous orders.\n"
+            "👤 *Profile:* check your balance and purchase stats.\n\n"
+            "Need help? Tap *Support*."
+        )
+        await query.edit_message_text(
+            guide,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main menu", callback_data="home")]]),
+            parse_mode="Markdown",
+        )
     elif data == "support":
         if SUPPORT_USERNAME:
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Contact support", url=f"https://t.me/{SUPPORT_USERNAME}")], [InlineKeyboardButton("⬅️ Main menu", callback_data="home")]])
@@ -928,7 +946,7 @@ def main() -> None:
     application.add_handler(CommandHandler("orders", admin_orders))
     application.add_handler(CommandHandler("resend", resend_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Starting Telegram Shop bot")
+    logger.info("Starting MSProject bot")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
